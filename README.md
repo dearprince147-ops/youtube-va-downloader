@@ -111,11 +111,41 @@ python3 app.py
    ```powershell
    git clone https://github.com/dearprince147-ops/youtube-va-downloader.git
    cd youtube-va-downloader
-   python app.py
    ```
-4. You can also just **double-click `app.py`** — the console window stays open at the end so you can read the results.
+4. **Double-click `yt.bat`** — that's it. See below for the one-tap setup.
 
 Downloads go to `%USERPROFILE%\Downloads\YouTube\`.
+
+#### Windows launcher (`yt.bat`)
+
+Double-clicking `yt.bat` runs the app **inside Windows Terminal using PowerShell**
+(falling back to plain PowerShell if Windows Terminal isn't installed).
+
+**On first run it offers to install a `yt` command**, so afterwards you can:
+
+- press **Win+R**, type **`yt`**, press **Enter**, or
+- type **`yt`** in any Terminal / PowerShell / cmd window,
+
+...and the app launches the same way — no `python app.py` needed.
+
+The shortcut is a small `yt.cmd` shim placed in your per-user
+`%LOCALAPPDATA%\Microsoft\WindowsApps` folder (already on every PATH), so
+**no admin rights are required**. If that folder is locked down, the script
+offers a machine-wide PATH fallback, which asks for **elevation** (a UAC prompt)
+once — and only then.
+
+> Requirements: Python on PATH (tick *"Add Python to PATH"* when installing) and,
+> ideally, Windows Terminal (usually pre-installed on Windows 11; install it from
+the Microsoft Store on Windows 10 for the tabbed experience).
+
+#### Run without a launcher (manual)
+
+```powershell
+python app.py
+```
+
+Or double-click `app.py` directly — the console window stays open at the end so
+you can read the results.
 
 ---
 
