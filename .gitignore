@@ -12,6 +12,7 @@ cookies.txt
 settings.json
 history.md
 debug.log
+failed_links.txt
 
 # ── Python ─────────────────────────────────────────────────────
 __pycache__/

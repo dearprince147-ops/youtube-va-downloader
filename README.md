@@ -1,13 +1,19 @@
-# ▶ YouTube Downloader — Terminal UI
+# ▶ YouTube Downloader — Terminal UI  `v4.1`
 
 A production-ready terminal UI for downloading **videos and audio** from YouTube.
 Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp) + [Rich](https://github.com/Textualize/rich).
 
 Works on **Android (Termux), Linux, macOS, and Windows 10/11**.
 
+> **What's new in v4.1** — failures are now explained in plain English with a
+> suggested fix, and saved to `failed_links.txt` for an easy retry. *Best available*
+> is no longer capped at 1080p (1440p/2160p now reachable), batch mode can target
+> 30/60fps, pasted links report duplicates and non-links, and same-titled videos no
+> longer overwrite each other.
+
 ```
 ══════════════════════════════════════════════════════════════
-▶  YouTube Downloader — Termux / Desktop  (Production v4.0)
+▶  YouTube Downloader — Termux / Desktop  (Production v4.1)
 ══════════════════════════════════════════════════════════════
 ```
 
@@ -15,6 +21,13 @@ Works on **Android (Termux), Linux, macOS, and Windows 10/11**.
 
 ## Features
 
+- **Clear failure reports** — every error gets a plain-English headline and a suggested fix, and failed links are saved to `failed_links.txt` so you can retry them later.
+- **Quality fix** — *Best available* is no longer capped at 1080p (H.264 is only a tie-breaker), so 1440p/2160p downloads are reachable. Batch mode also offers 720p/1080p at 30 or 60fps.
+- **Smart link handling** — pasting text reports anything that isn't a link and any duplicates, and a video already inside a pasted playlist is skipped instead of downloaded twice.
+- **No silent overwrites** — two different videos with the same title are saved with their video ID in the filename.
+- **Honest playlists** — private/deleted playlist entries are counted and reported instead of being mistaken for "already downloaded".
+- **Preflight check** — warns before starting if the download folder is unwritable or nearly full.
+- **Won't crash out** — an unexpected error returns you to the menu with details in `debug.log`.
 - **Single video, full playlist, or batch of many links** — all handled by one engine.
 - **Parallel downloads** with a live dashboard: overall progress, per-item bars, speed, ETA, recent results.
 - **Queue multiple links at once** — paste them and they download in parallel (default 4×, configurable).
@@ -170,11 +183,29 @@ What do you want to do?
 
 - **Single Video** — shows a preview (title, duration, channel, available qualities), pick quality or audio-only, confirm.
 - **Entire Playlist** — previews the playlist, choose a quality cap, and it skips anything already downloaded.
-- **Multiple URLs** — paste any number of links (one per line or space-separated); they queue and download in parallel.
+- **Multiple URLs** — paste any number of links (one per line or space-separated); they queue and download in parallel. Anything that isn't a link and any duplicates are reported, and a video already inside a pasted playlist is skipped.
 - **Settings** — change parallel-download count and cookie mode.
 - **Install updates** — appears in the menu when a newer `yt-dlp` is available.
 
 Press `Ctrl+C` at any time for a clean stop — partial files resume next run.
+
+### When a download fails
+
+Each failure is shown with a plain-English reason and a suggested fix, for example:
+
+| What happened | What the app tells you |
+|---------------|------------------------|
+| Private / deleted video | *Only the owner can watch it — cookies from an account with access may help.* |
+| Age-restricted | *Turn on cookies (Settings) with a logged-in `cookies.txt`.* |
+| "Sign in to confirm you're not a bot" | *Use a fresh `cookies.txt` and update yt-dlp.* |
+| Members-only | *Needs a channel membership — use cookies from that account.* |
+| Geo-blocked | *A VPN may help.* |
+| Rate-limited (HTTP 429) | *Lower the parallel count (Settings) and retry in a few minutes.* |
+| Disk full / no permission | *Free up storage* / *run `termux-setup-storage`.* |
+| yt-dlp out of date | *Update yt-dlp (press U in the menu if shown) and retry.* |
+
+Every failed link is also written to **`failed_links.txt`** in the project folder, so you
+can open **Multiple URLs** and paste them straight back in to retry.
 
 ### Settings (`settings.json`)
 
@@ -244,6 +275,7 @@ Run the downloader with a single tap from your Android home screen using
 | "Sign in to confirm you're not a bot" | Add `cookies.txt` and set Cookies to **on**. |
 | Downloads fail after a while | Update yt-dlp: run the menu's **Install updates**, or `pip install -U yt-dlp`. |
 | Can't write to `/sdcard` on Termux | Run `termux-setup-storage` and grant permission. |
+| Some videos failed | Read the failure panel — each one says why and what to do. Then retry from `failed_links.txt`. |
 | Something crashed | Check `debug.log` in the project folder. |
 
 ---

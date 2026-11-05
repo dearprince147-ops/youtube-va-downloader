@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
 """
 ══════════════════════════════════════════════════════════════
-▶  YouTube Downloader — Termux / Desktop  (Production v4.0)
+▶  YouTube Downloader — Termux / Desktop  (Production v4.1)
 ══════════════════════════════════════════════════════════════
 A production-ready terminal UI for downloading videos and audio
 from YouTube.
 
-What's new in v4.0
-  • Instant start-up — yt-dlp loads in the background while the menu
-    is already on screen; the update check no longer blocks launch.
-  • One download engine for everything: single video, playlist, or a
-    batch of many links — all run in parallel with a live dashboard
-    (overall progress, per-item bars, speed, ETA, recent results).
-  • Paste several links at once and they're queued automatically.
-  • Faster downloads: metadata fetched for the preview is reused for
-    the download (no second extraction) and chunked HTTP is used
-    everywhere.
-  • Clean Ctrl+C: stops all workers immediately; partial files resume.
+What's new in v4.1
+  • Failures are explained, not dumped.  Every error is matched against
+    ~17 rules (private, age-gate, bot check, members-only, geo-block,
+    429/403/404, disk full, ffmpeg, network, yt-dlp breakage) and shown
+    with a plain-English headline and what to do about it.
+  • Failed links are written to failed_links.txt so you can paste them
+    straight back into "Multiple URLs" later.
+  • The live dashboard keeps failed items on screen instead of letting
+    later successes push them out, and each item shows the resolution
+    and fps it is really downloading (e.g. 1080p60).
+  • Quality fix: "Best available" no longer stops at 1080p.  H.264 is
+    now only a tie-breaker, so 1440p/2160p (VP9/AV1) are reachable.
+    Batch mode also offers 720p/1080p at 30 or 60fps.
+  • Pasting links ignores non-links instead of silently dropping them,
+    reports duplicate links, and skips a video that is already inside
+    a playlist you pasted.
+  • Same-titled videos no longer overwrite each other — the later ones
+    are saved with their video ID in the name.
+  • Private/deleted playlist entries are counted and skipped honestly
+    instead of being reported as "already downloaded".
+  • A preflight check warns before starting if the download folder is
+    unwritable or nearly full, and an unexpected error drops you back
+    at the menu with the details in debug.log instead of crashing.
 
-Kept from v3.x: automatic dependency management, resume support,
-download history, cookie-based authentication, H.264/AAC safety
-net, skip-already-downloaded for playlists, retry prompts, Windows
-ffmpeg auto-install, Termux storage setup.
+Kept from v4.0/v3.x: instant start-up, one parallel engine for single
+videos / playlists / batches, metadata reuse so previews aren't fetched
+twice, clean Ctrl+C with resume, automatic dependency management,
+download history, cookie-based authentication, H.264/AAC safety net,
+skip-already-downloaded for playlists, Windows ffmpeg auto-install,
+Termux storage setup.
 
 Fully cross-platform:  Termux (Android), Linux, macOS, Windows 10/11.
 
@@ -158,7 +172,7 @@ def ytdlp():
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "")
 
 if IS_TERMUX:
@@ -171,6 +185,7 @@ HISTORY_MD_FILE = SCRIPT_DIR / "history.md"
 COOKIES_FILE = SCRIPT_DIR / "cookies.txt"
 SETTINGS_FILE = SCRIPT_DIR / "settings.json"
 DEBUG_LOG_FILE = SCRIPT_DIR / "debug.log"
+FAILED_LINKS_FILE = SCRIPT_DIR / "failed_links.txt"
 
 # Fallback quality list used for playlists (where per-video format
 # info isn't available) or when metadata extraction fails.
@@ -185,8 +200,14 @@ _FALLBACK_QUALITIES = [
     {"height": 2160, "fps": 60},
 ]
 
-# Height caps offered in batch mode (videos differ, so "up to" semantics).
-_BATCH_HEIGHTS = [360, 480, 720, 1080, 1440, 2160]
+# (max height, preferred fps) offered in batch mode.  Videos differ, so these
+# are "up to" caps; fps 0 = no preference (360p/480p).
+_BATCH_OPTIONS = [
+    (360, 0), (480, 0),
+    (720, 30), (720, 60),
+    (1080, 30), (1080, 60),
+    (1440, 60), (2160, 60),
+]
 
 AUDIO_CHOICES = {
     "1": ("WAV — Lossless / Editing",              {"codec": "wav", "quality": "0"}),
@@ -883,25 +904,67 @@ def normalize_youtube_url(url: str) -> str:
     return url
 
 
-def parse_urls(text: str) -> list[str]:
-    """Extract every URL from free text (space/comma/newline separated).
-    If no scheme-prefixed URL is found the raw text is returned as one
-    candidate so ``youtube.com/watch?v=…`` still works."""
-    found = _URL_RE.findall(text or "")
-    if not found and (text or "").strip():
-        found = [text.strip()]
-    return found
+_BARE_DOMAIN_RE = re.compile(r"^(?:[\w-]+\.)+[a-z]{2,}(?:[/?#].*)?$", re.IGNORECASE)
+_VID_RE = re.compile(
+    r"(?:youtu\.be/|youtube\.com/(?:shorts/|embed/|live/)|[?&]v=)([A-Za-z0-9_-]{11})")
+_LIST_RE = re.compile(r"[?&]list=([A-Za-z0-9_-]+)")
 
 
-def _dedupe(urls: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
+def parse_urls(text: str) -> tuple[list[str], list[str]]:
+    """Pull links out of free text (space / comma / newline separated).
+    Returns ``(urls, ignored_tokens)`` — bare domains such as
+    ``youtube.com/watch?v=…`` get ``https://`` added; anything that isn't
+    a link at all is reported back instead of being silently dropped."""
+    text = text or ""
+    found = _URL_RE.findall(text)
+    ignored: list[str] = []
+    for tok in re.split(r"[\s,;]+", _URL_RE.sub(" ", text)):
+        tok = tok.strip("\"'()<>[]")
+        if not tok:
+            continue
+        if _BARE_DOMAIN_RE.match(tok):
+            found.append("https://" + tok)
+        else:
+            ignored.append(tok)
+    return found, ignored
+
+
+def _link_key(url: str) -> tuple[str, str]:
+    """Identity of a link, so different spellings of the same video
+    (youtu.be/…, &t=30s, &list=… on a watch link) count as duplicates."""
+    n = normalize_youtube_url(url)
+    if _looks_like_playlist(n):
+        m = _LIST_RE.search(n)
+        if m:
+            return ("pl", m.group(1))
+    else:
+        m = _VID_RE.search(n)
+        if m:
+            return ("v", m.group(1))
+    return ("url", n.rstrip("/").lower())
+
+
+def _short_url(url: str, n: int = 62) -> str:
+    u = re.sub(r"^https?://(www\.)?", "", url)
+    return u if len(u) <= n else u[: n - 1] + "…"
+
+
+def _dedupe(urls: list[str]) -> tuple[list[str], list[str]]:
+    """Returns ``(unique_urls, duplicate_urls)`` keeping the first of each."""
+    seen: set[tuple[str, str]] = set()
+    unique: list[str] = []
+    dups: list[str] = []
     for u in urls:
         u = normalize_youtube_url(u)
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+        if not u:
+            continue
+        key = _link_key(u)
+        if key in seen:
+            dups.append(u)
+        else:
+            seen.add(key)
+            unique.append(u)
+    return unique, dups
 
 
 @lru_cache(maxsize=1)
@@ -983,7 +1046,7 @@ def _fetch_info_core(
 
     try:
         fallback = {
-            **_get_ytdlp_base_opts(None), **common,
+            **_get_ytdlp_base_opts(None), **common, "logger": collector,
             "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         }
         with yt.YoutubeDL(fallback) as ydl:
@@ -1000,14 +1063,10 @@ def fetch_info(
     url: str,
     is_playlist: bool,
     cookiefile: str | None = None,
-) -> dict | None:
-    """Extract metadata with a spinner (for the interactive preview)."""
+) -> tuple[dict | None, str]:
+    """Extract metadata with a spinner.  Returns ``(info, failure_reason)``."""
     with console.status("[cyan]Fetching info…[/]", spinner="dots"):
-        info, reason = _fetch_info_core(url, is_playlist, cookiefile)
-    if info:
-        return info
-    console.print(f"[dim]⚠ Couldn't load a preview ({esc(reason)}) — continuing anyway.[/]\n")
-    return None
+        return _fetch_info_core(url, is_playlist, cookiefile)
 
 
 def _info_grid() -> Table:
@@ -1117,6 +1176,7 @@ class _Item:
     audio_stage: bool = False
     started: float = field(default_factory=time.monotonic)
     path: str = ""
+    res: str = ""                  # e.g. 1080p60 — what is really downloading
 
 
 class Dashboard:
@@ -1130,7 +1190,8 @@ class Dashboard:
         self.existing = already_done
         self.failed = 0
         self.items: dict[str, _Item] = {}
-        self.recent: deque = deque(maxlen=8)
+        self.recent: deque = deque(maxlen=8)   # (ok, title, note) — successes
+        self.fails: deque = deque(maxlen=4)    # (key, title, note) — stay visible
         self.failed_keys: set[str] = set()
         self.bytes_done = 0
         self.t0 = time.monotonic()
@@ -1148,6 +1209,7 @@ class Dashboard:
             if key in self.failed_keys:          # retry pass
                 self.failed_keys.discard(key)
                 self.failed = max(0, self.failed - 1)
+                self.fails = deque((f for f in self.fails if f[0] != key), maxlen=4)
             self._add(key, title, idx)
 
     def reset(self, key: str, stage: str) -> None:
@@ -1162,15 +1224,15 @@ class Dashboard:
                 it.processing = False
                 it.stage = stage
 
-    def finish(self, key: str, ok: bool, note: str = "") -> tuple[str, int]:
-        """Mark an item finished.  Returns ``(final_path, size_bytes)``."""
+    def finish(self, key: str, ok: bool, note: str = "") -> tuple[str, int, str]:
+        """Mark an item finished.  Returns ``(final_path, size_bytes, res)``."""
         with self.lock:
             return self._finish_locked(key, ok, note)
 
-    def _finish_locked(self, key: str, ok: bool, note: str = "") -> tuple[str, int]:
+    def _finish_locked(self, key: str, ok: bool, note: str = "") -> tuple[str, int, str]:
         it = self.items.pop(key, None)
         if it is None:
-            return "", 0
+            return "", 0, ""
         size = 0
         if it.path:
             try:
@@ -1185,10 +1247,14 @@ class Dashboard:
             self.failed_keys.add(key)
         if ok:
             note = " · ".join(x for x in (
+                it.res,
                 _fmt_bytes(size) if size else "",
                 _fmt_dur(time.monotonic() - it.started)) if x)
-        self.recent.append((ok, it.title, note))
-        return it.path, size
+        if ok:
+            self.recent.append((True, it.title, note))
+        else:
+            self.fails.append((key, it.title, note))
+        return it.path, size, it.res
 
     def finish_all(self, ok: bool) -> None:
         """Close any items still open (whole-playlist fallback mode)."""
@@ -1251,9 +1317,14 @@ class Dashboard:
             it.frac = max(it.frac, min(frac, 1.0))
 
             it.audio_stage = st["audio"]
+            if not st["audio"] and info.get("height"):
+                fps = info.get("fps")
+                it.res = f"{info['height']}p" + (f"{round(fps)}" if fps else "")
             if not it.processing:
                 kind = "audio" if st["audio"] else "video"
                 it.stage = f"{kind} {st['n']}/{it.expected}" if it.expected > 1 else kind
+                if it.res and not st["audio"]:
+                    it.stage += f" · {it.res}"
 
     def pp_hook(self, key: str, d: dict, dynamic: bool = False) -> None:
         info = d.get("info_dict") or {}
@@ -1308,7 +1379,7 @@ class Dashboard:
                 s.append(f"  🔄 {len(active)}", style="cyan")
                 s.append(f"  ⏳ {queued}", style="white")
                 if self.failed:
-                    s.append(f"  ⚠ {self.failed}", style="yellow")
+                    s.append(f"  ✗ {self.failed}", style="bold red")
             else:
                 s.append(f"📊 {self.done}/{self.total} done", style="bold green")
                 if self.existing:
@@ -1319,7 +1390,7 @@ class Dashboard:
                 s.append(f"⏳ {queued} queued", style="white")
                 if self.failed:
                     s.append(sep, style="dim")
-                    s.append(f"⚠ {self.failed} skipped", style="yellow")
+                    s.append(f"✗ {self.failed} failed", style="bold red")
             rows.append(s)
             # ProgressBar has no trailing newline — give it its own grid row.
             bar_row = Table.grid(expand=True)
@@ -1342,7 +1413,8 @@ class Dashboard:
                        title_align="left", border_style="cyan", padding=(0, 1))
 
         # recent results -------------------------------------------------
-        recent = list(self.recent)[-3:] if not compact else []
+        recent = ([(False, t, n) for _, t, n in list(self.fails)[-2:]]
+                  + list(self.recent)[-3:]) if not compact else []
         parts: list = [header]
 
         # active rows (as many as fit) ----------------------------------
@@ -1364,8 +1436,8 @@ class Dashboard:
             g.add_column(width=1, no_wrap=True)
             g.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
             g.add_column(no_wrap=True, justify="right", max_width=max(10, width // 2))
-            g.add_row(Text("✓" if ok else "✗", style="green" if ok else "red"),
-                      Text(title, style="dim"),
+            g.add_row(Text("✓" if ok else "✗", style="green" if ok else "bold red"),
+                      Text(title, style="dim" if ok else "red"),
                       Text(note[:60], style="dim" if ok else "red", overflow="ellipsis",
                            no_wrap=True))
             parts.append(g)
@@ -1450,6 +1522,8 @@ class DownloadResult:
     failed: int = 0
     errors: list[str] = field(default_factory=list)
     cancelled: bool = False
+    failures: list = field(default_factory=list)   # dicts: title,url,headline,hint,raw
+    failed_file: str = ""                          # path of failed_links.txt, if written
 
     @property
     def succeeded(self) -> int:
@@ -1482,10 +1556,12 @@ class Job:
     info_stale: bool = False
     dynamic: bool = False           # whole-playlist single-call fallback
     hint: int = 1                   # how many videos this job stands for
+    unique: bool = False            # add [video id] to the filename (title clash)
     ok: bool = False
     error: str = ""
     path: str = ""
     size: int = 0
+    res: str = ""
 
     def reset(self) -> None:
         self.ok, self.error = False, ""
@@ -1503,7 +1579,10 @@ class Source:
     info_time: float = field(default_factory=time.time)
     jobs: list[Job] = field(default_factory=list)
     skipped: int = 0
+    unavailable: int = 0            # private / deleted playlist entries
 
+
+_UNAVAILABLE_TITLES = {"[private video]", "[deleted video]", "private video", "deleted video"}
 
 _PERMANENT_HINTS = (
     "private video", "video unavailable", "this video is not available",
@@ -1517,6 +1596,63 @@ _PERMANENT_HINTS = (
 def _is_permanent_error(msg: str) -> bool:
     low = (msg or "").lower()
     return any(h in low for h in _PERMANENT_HINTS)
+
+
+# (substrings to look for, headline, what-to-do hint) — first match wins.
+_ERROR_RULES: list[tuple[tuple[str, ...], str, str]] = [
+    (("private video",), "Private video",
+     "Only the owner can watch it — cookies from an account with access may help."),
+    (("confirm your age", "age-restricted", "age restricted"), "Age-restricted video",
+     "Turn on cookies (Settings) with a logged-in cookies.txt."),
+    (("sign in to confirm", "not a bot"), "YouTube bot check",
+     "Use a fresh cookies.txt and update yt-dlp (press U in the menu if shown)."),
+    (("members-only", "members only", "join this channel"), "Members-only video",
+     "Needs a channel membership — use cookies from that account."),
+    (("not made this video available in your country", "who has blocked it", "geo-restrict",
+      "geo restrict"), "Blocked in your country", "A VPN may help."),
+    (("copyright",), "Blocked for copyright", "Nothing can be done from this side."),
+    (("premieres in", "live event will begin", "this live event"), "Not available yet",
+     "It hasn't premiered / started — try again later."),
+    (("video unavailable", "this video is not available", "has been removed",
+      "account associated", "terminated", "no longer available"), "Video unavailable",
+     "It was removed or made private by the uploader."),
+    (("http error 429", "too many requests"), "Rate-limited by YouTube",
+     "Lower the parallel count (Settings) and retry in a few minutes."),
+    (("http error 403", "forbidden"), "Access denied (HTTP 403)",
+     "Retry — if it keeps happening, update yt-dlp."),
+    (("http error 404", "http error 410", "404: not found", "404: file not found"),
+     "Page not found (HTTP 404)",
+     "The link is wrong, incomplete, or the video/page was removed."),
+    (("no space left", "disk full", "errno 28", "not enough space"), "Disk is full",
+     "Free up storage, then retry — partial files resume."),
+    (("permission denied", "errno 13", "read-only file system", "errno 30"),
+     "Can't write to the download folder",
+     "Check storage permission (Termux: run termux-setup-storage)."),
+    (("requested format is not available", "requested format not available"),
+     "That quality isn't available for this video",
+     "Pick a lower quality or 'Best available'."),
+    (("ffmpeg not found", "ffmpeg is not installed", "ffprobe and ffmpeg", "ffmpeg: not found"),
+     "ffmpeg is missing", "Install it (Termux: pkg install ffmpeg), then retry."),
+    (("unsupported url", "is not a valid url", "no suitable extractor"), "Unsupported link",
+     "Check that the URL is complete and correct."),
+    (("timed out", "timeout", "connection reset", "connection aborted", "name or service not known",
+      "getaddrinfo", "temporary failure", "network is unreachable", "unable to connect",
+      "failed to resolve", "remote end closed", "incomplete read", "connection refused",
+      "ssl", "urlopen error", "httpconnection"), "Network problem",
+     "Check your connection, then retry — partial files resume."),
+    (("unable to extract", "nsig", "signature", "unable to download video data",
+      "unable to download webpage", "unable to download api page"), "YouTube changed or blocked the request",
+     "Update yt-dlp (press U in the menu if shown) and retry."),
+]
+
+
+def explain_error(msg: str) -> tuple[str, str]:
+    """Turn a raw yt-dlp / OS error into ``(headline, hint)`` for humans."""
+    low = (msg or "").lower()
+    for needles, headline, hint in _ERROR_RULES:
+        if any(n in low for n in needles):
+            return headline, hint
+    return (_short(msg, 90) or "Download failed"), ""
 
 
 def _short(msg: str, n: int = 160) -> str:
@@ -1625,6 +1761,8 @@ def _job_opts(job: Job, ctx: _Ctx, collector: _ErrorCollector) -> dict:
             DOWNLOAD_DIR / "%(playlist_title)s" /
             "%(playlist_index)02d - %(title).80s.%(ext)s"
         )
+    elif job.unique:
+        outtmpl = str(job.folder / "%(title).80s [%(id)s].%(ext)s")
     else:
         outtmpl = str(job.folder / "%(title).80s.%(ext)s")
 
@@ -1774,8 +1912,8 @@ def run_jobs(
             if job.dynamic:
                 dash.finish_all(ok)
             else:
-                job.path, job.size = dash.finish(
-                    job.key, ok, "" if ok else _short(job.error, 60))
+                job.path, job.size, job.res = dash.finish(
+                    job.key, ok, "" if ok else explain_error(job.error)[0][:60])
 
     cancelled = False
     with _live(dash):
@@ -1876,8 +2014,17 @@ def build_jobs(sources: list[Source], plan: Plan) -> tuple[list[Job], int]:
             jobs.append(j)
             continue
 
-        entries = _playlist_entries(src.info)
-        if not entries:
+        raw_entries = _playlist_entries(src.info)
+        entries = [e for e in raw_entries
+                   if e[2].strip().lower() not in _UNAVAILABLE_TITLES]
+        src.unavailable = len(raw_entries) - len(entries)
+        if src.unavailable:
+            console.print(
+                f"  [yellow]⚠ {src.unavailable} video(s) in this playlist are private or "
+                f"deleted and can't be downloaded — skipped.[/]\n")
+        if raw_entries and not entries:
+            continue
+        if not raw_entries:
             # No flat listing — let yt-dlp walk the whole playlist itself.
             j = Job(key=f"{si}:{src.url}", url=src.url, title=src.title,
                     folder=DOWNLOAD_DIR, src=si, dynamic=True,
@@ -1908,28 +2055,126 @@ def build_jobs(sources: list[Source], plan: Plan) -> tuple[list[Job], int]:
     return jobs, skipped_total
 
 
+def _failure_record(j: Job) -> dict:
+    head, hint = explain_error(j.error)
+    return {"title": j.title, "url": j.url, "headline": head, "hint": hint,
+            "raw": _short(j.error, 200)}
+
+
+def print_failures(jobs: list[Job]) -> None:
+    """A clear, hard-to-miss report of everything that failed and why."""
+    bad = [j for j in jobs if not j.ok and j.error]
+    if not bad:
+        return
+    lines: list = []
+    for j in bad[:12]:
+        head, hint = explain_error(j.error)
+        t = Text()
+        t.append("✗ ", style="bold red")
+        t.append(j.title[:90], style="bold")
+        t.append(f"\n   {head}", style="red")
+        if hint:
+            t.append(f"\n   → {hint}", style="dim")
+        lines.append(t)
+    if len(bad) > 12:
+        lines.append(Text(f"… and {len(bad) - 12} more (see failed_links.txt)", style="dim"))
+    console.print(Panel(
+        Group(*lines),
+        title=f"[bold red]✗ {len(bad)} download{'s' if len(bad) != 1 else ''} failed[/]",
+        title_align="left", border_style="red", padding=(0, 1),
+    ))
+    console.print()
+
+
 def print_run_summary(jobs: list[Job]) -> None:
     """Printed after the live view closes (the alternate screen would
     otherwise take all results and errors with it)."""
     if not jobs:
         return
     good = [j for j in jobs if j.ok]
-    bad = [j for j in jobs if not j.ok]
     if len(jobs) > 1:
         total_size = sum(j.size for j in good)
         console.print(Rule("[cyan]Summary[/]", style="dim"))
         if good:
             extra = f"  [dim]({_fmt_bytes(total_size)})[/]" if total_size else ""
             console.print(f"  [green]✓ {len(good)} downloaded[/]{extra}")
-        for j in bad[:15]:
-            console.print(f"  [red]✗ {esc(j.title[:60])}[/] [dim]— {esc(_short(j.error, 90) or 'failed')}[/]")
-        if len(bad) > 15:
-            console.print(f"  [dim]… and {len(bad) - 15} more[/]")
+            if len(good) <= 12:
+                for j in good:
+                    tag = f"[cyan]{j.res}[/] · " if j.res else ""
+                    console.print(f"    [dim]{tag}{esc(j.title[:55])}[/]")
         console.print()
     else:
-        for j in bad:
-            if j.error:
-                console.print(f"[red]✗ {esc(j.error)}[/]")
+        for j in good:
+            if j.res:
+                size = f" · {_fmt_bytes(j.size)}" if j.size else ""
+                console.print(f"  [green]✓[/] Downloaded at [bold cyan]{j.res}[/]{size}")
+    print_failures(jobs)
+
+
+def _save_failed_links(jobs: list[Job]) -> str:
+    """Write failed links to a file so they can be pasted back in later."""
+    urls = []
+    for j in jobs:
+        if not j.ok and j.error and j.url not in urls:
+            urls.append(j.url)
+    if not urls:
+        return ""
+    try:
+        FAILED_LINKS_FILE.write_text("\n".join(urls) + "\n", encoding="utf-8")
+        return str(FAILED_LINKS_FILE)
+    except OSError as e:
+        log.warning("Could not write failed links: %s", e)
+        return ""
+
+
+def _preflight() -> tuple[bool, str]:
+    """Check the download folder is usable and has room.  Returns
+    ``(ok_to_continue, problem_headline)``."""
+    try:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        if not os.access(DOWNLOAD_DIR, os.W_OK):
+            raise PermissionError(f"Permission denied: {DOWNLOAD_DIR}")
+    except OSError as e:
+        head, hint = explain_error(str(e))
+        console.print(Panel(
+            f"[bold red]✗ Can't use the download folder[/]\n{esc(str(DOWNLOAD_DIR))}\n"
+            f"[red]{esc(head)}[/]" + (f"\n[dim]→ {esc(hint)}[/]" if hint else ""),
+            border_style="red", padding=(0, 1),
+        ))
+        return False, head
+    try:
+        free = shutil.disk_usage(DOWNLOAD_DIR).free
+    except OSError:
+        return True, ""
+    if free < 300 * 1024 * 1024:
+        if not Confirm.ask(
+            f"[yellow]Only {_fmt_bytes(free)} free in the download folder. "
+            f"Continue anyway?[/]", default=False,
+        ):
+            return False, ""
+    return True, ""
+
+
+def _separate_title_clashes(jobs: list[Job]) -> None:
+    """Two different videos can share a title.  Without care they'd write the
+    same file (the second would be skipped as 'already downloaded', or the two
+    parallel downloads would fight over one .part file).  Give the later ones
+    their video ID in the name instead."""
+    sanitize = ytdlp().utils.sanitize_filename
+    seen: dict[tuple[str, str], int] = {}
+    clashes = 0
+    for j in jobs:
+        if j.dynamic:
+            continue
+        key = (str(j.folder), sanitize(j.title, restricted=True)[:80].lower())
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            j.unique = True
+            clashes += 1
+    if clashes:
+        console.print(
+            f"  [yellow]ℹ {clashes} item(s) share a title with another item — "
+            f"saving those with their video ID in the name so none is overwritten.[/]\n")
 
 
 def execute(
@@ -1942,8 +2187,19 @@ def execute(
     """Build jobs for ``sources``, run them, and offer interactive retries."""
     jobs, skipped = build_jobs(sources, plan)
     if not jobs:
-        console.print("  [bold green]✓ All videos already downloaded![/]\n")
-        return DownloadResult(ok=True, total=max(1, skipped), failed=0)
+        unavailable = sum(s.unavailable for s in sources)
+        if skipped or not unavailable:
+            console.print("  [bold green]✓ All videos already downloaded![/]\n")
+            return DownloadResult(ok=True, total=max(1, skipped), failed=0)
+        msg = "Every video in this playlist is private or deleted."
+        console.print(f"  [bold red]✗ Nothing to download — {msg}[/]\n")
+        return DownloadResult(ok=False, total=unavailable, failed=unavailable, errors=[msg])
+
+    can_go, problem = _preflight()
+    if not can_go:
+        return DownloadResult(ok=False, total=len(jobs) + skipped, failed=len(jobs),
+                              errors=[problem] if problem else [], cancelled=not problem)
+    _separate_title_clashes(jobs)
 
     total = len(jobs) + skipped
     console.print(Rule(f"[cyan]{esc(title)}[/]", style="dim"))
@@ -1990,10 +2246,11 @@ def execute(
         failed=len(failed_jobs),
         errors=errors,
         cancelled=cancelled,
+        failures=[_failure_record(j) for j in failed_jobs if j.error],
+        failed_file=_save_failed_links(failed_jobs),
     )
 
 
-#  QUALITY DETECTION
 # ═══════════════════════════════════════════════════════════════
 def _format_filesize(size: int) -> str:
     if size <= 0:
@@ -2137,13 +2394,16 @@ def _video_format(height: int, fps: float, is_playlist: bool) -> str:
 
     avc = "[vcodec^=avc1]"
     aac = "[acodec^=mp4a]"
+    # The exact height must win over "a lower height that happens to be
+    # H.264" — YouTube only offers 1440p/2160p as VP9/AV1, so the old
+    # order silently dropped those to 1080p.
     return "/".join([
         f"bestvideo{h_exact}{f_exact}{avc}+bestaudio{aac}",
         f"bestvideo{h_exact}{avc}+bestaudio{aac}",
-        f"bestvideo{h_max}{f_exact}{avc}+bestaudio{aac}",
-        f"bestvideo{h_max}{avc}+bestaudio{aac}",
         f"bestvideo{h_exact}{f_exact}+bestaudio",
         f"bestvideo{h_exact}+bestaudio",
+        f"bestvideo{h_max}{f_exact}{avc}+bestaudio{aac}",
+        f"bestvideo{h_max}{avc}+bestaudio{aac}",
         f"bestvideo{h_max}{f_exact}+bestaudio",
         f"bestvideo{h_max}+bestaudio",
         "bestvideo+bestaudio",
@@ -2152,13 +2412,10 @@ def _video_format(height: int, fps: float, is_playlist: bool) -> str:
     ])
 
 
-_BEST_FORMAT = "/".join([
-    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]",
-    "bestvideo[vcodec^=avc1]+bestaudio",
-    "best[vcodec^=avc1][acodec^=mp4a]",
-    "bestvideo+bestaudio",
-    "best",
-])
+# Used for "Best available".  The old version listed H.264 first, which on
+# YouTube means "best H.264" = 1080p max; resolution/fps now come first and
+# H.264 is only a tie-breaker (set via format_sort where this is used).
+_BEST_FORMAT = "bestvideo+bestaudio/best"
 
 
 def choose_video(info: dict | None, is_playlist: bool) -> Plan | None:
@@ -2181,8 +2438,9 @@ def choose_video(info: dict | None, is_playlist: bool) -> Plan | None:
     if choice == "0":
         return None
     if choice == best_key:
-        return Plan("video", {"format": _BEST_FORMAT, "merge_output_format": "mp4"},
-                    "Best available")
+        return Plan("video", {"format": _BEST_FORMAT,
+                              "format_sort": ["res", "fps", "vcodec:h264", "acodec:aac"],
+                              "merge_output_format": "mp4"}, "Best available")
 
     q = qualities[int(choice) - 1]
     height, fps = q["height"], q.get("fps", 0)
@@ -2192,20 +2450,39 @@ def choose_video(info: dict | None, is_playlist: bool) -> Plan | None:
                           "merge_output_format": "mp4"}, label)
 
 
+def _cap_plan(height: int, fps: int) -> Plan:
+    """Best video up to ``height``, preferring ``fps`` (60 → 50/60fps when
+    the video has it, 30 → capped at 30).  Resolution wins first, then fps,
+    then H.264/AAC (no re-encode needed) as the tie-breaker."""
+    sort = ["res", f"fps:{fps}" if fps else "fps", "vcodec:h264", "acodec:aac"]
+    fmt = (f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+           "/bestvideo+bestaudio/best")
+    label = f"up to {height}p" + (f" @ {fps}fps" if fps else "")
+    return Plan("video", {"format": fmt, "format_sort": sort,
+                          "merge_output_format": "mp4"}, label)
+
+
 def choose_video_cap() -> Plan | None:
-    """Batch mode: videos differ, so pick a maximum height."""
-    options = {str(i): f"Up to {h}p" for i, h in enumerate(_BATCH_HEIGHTS, 1)}
-    best_key = str(len(_BATCH_HEIGHTS) + 1)
-    options[best_key] = "Best available"
+    """Batch mode: videos differ, so pick a maximum height (and fps)."""
+    options: dict[str, str] = {}
+    for i, (h, fps) in enumerate(_BATCH_OPTIONS, 1):
+        if fps == 60:
+            options[str(i)] = f"Up to {h}p @ 60fps  [dim]60 (or 50) fps when the video has it[/]"
+        elif fps == 30:
+            options[str(i)] = f"Up to {h}p @ 30fps"
+        else:
+            options[str(i)] = f"Up to {h}p"
+    best_key = str(len(_BATCH_OPTIONS) + 1)
+    options[best_key] = "Best available  [dim]highest resolution + fps[/]"
     choice = menu("Select Video Quality (applies to every item):", options, back=True)
     if choice == "0":
         return None
     if choice == best_key:
-        return Plan("video", {"format": _BEST_FORMAT, "merge_output_format": "mp4"},
-                    "Best available")
-    h = _BATCH_HEIGHTS[int(choice) - 1]
-    return Plan("video", {"format": _video_format(h, 0, True),
-                          "merge_output_format": "mp4"}, f"up to {h}p")
+        return Plan("video", {"format": _BEST_FORMAT,
+                              "format_sort": ["res", "fps", "vcodec:h264", "acodec:aac"],
+                              "merge_output_format": "mp4"}, "Best available")
+    h, fps = _BATCH_OPTIONS[int(choice) - 1]
+    return _cap_plan(h, fps)
 
 
 def choose_audio() -> Plan | None:
@@ -2257,7 +2534,8 @@ def _log_sources(sources: list[Source], result: DownloadResult,
     for src in sources:
         label = base_label + (" (Playlist)" if src.is_playlist
                               else " (Batch)" if batch else "")
-        ok = (not result.cancelled) and all(j.ok for j in src.jobs)
+        ok = ((not result.cancelled) and all(j.ok for j in src.jobs)
+              and not (src.unavailable and not src.jobs and not src.skipped))
         log_history(src.url, {"title": src.title}, label, ok)
 
 
@@ -2274,7 +2552,20 @@ def simple_flow(url: str, is_playlist: bool, cookiefile: str | None) -> Download
         ):
             return None
 
-    info = fetch_info(url, is_playlist, cookiefile=cookiefile)
+    info, reason = fetch_info(url, is_playlist, cookiefile=cookiefile)
+    if info is None:
+        head, hint = explain_error(reason)
+        if _is_permanent_error(reason):
+            # No point walking through quality menus for a video that can't be fetched.
+            console.print(Panel(
+                f"[bold red]✗ Can't download this {'playlist' if is_playlist else 'video'}[/]\n"
+                f"[red]{esc(head)}[/]" + (f"\n[dim]→ {esc(hint)}[/]" if hint else ""),
+                border_style="red", padding=(0, 1),
+            ))
+            log_history(url, {"title": url}, "PLAYLIST" if is_playlist else "VIDEO", False)
+            pause()
+            return None
+        console.print(f"[dim]⚠ Couldn't load a preview ({esc(head)}) — continuing anyway.[/]\n")
     if is_playlist:
         if info:
             count = show_playlist_preview(info)
@@ -2343,7 +2634,7 @@ def show_queue(sources: list[Source]) -> None:
     table.add_column("Info", no_wrap=True, justify="right")
     for i, s in enumerate(sources, 1):
         if s.error and not s.info:
-            info = Text(f"✗ {_short(s.error, 28)}", style="red")
+            info = Text(f"✗ {explain_error(s.error)[0][:30]}", style="red")
         elif s.is_playlist:
             info = Text(f"☰ {s.count} videos", style="magenta")
         else:
@@ -2356,7 +2647,7 @@ def show_queue(sources: list[Source]) -> None:
 
 def batch_flow(urls: list[str], cookiefile: str | None) -> DownloadResult | None:
     """Many links (videos and/or playlists) downloaded together."""
-    urls = _dedupe(urls)
+    urls = _dedupe(urls)[0]
     if not urls:
         return None
     others = [u for u in urls if not is_youtube_url(u)]
@@ -2374,8 +2665,31 @@ def batch_flow(urls: list[str], cookiefile: str | None) -> DownloadResult | None
     show_queue(sources)
     for s in bad:
         log_history(s.url, {"title": s.title}, "VIDEO (Batch)", False)
+    if bad:
+        lines = []
+        for src in bad:
+            head, hint = explain_error(src.error)
+            t = Text()
+            t.append(f"✗ {_short_url(src.url, 56)}", style="bold")
+            t.append(f"\n   {head}", style="red")
+            if hint:
+                t.append(f"\n   → {hint}", style="dim")
+            lines.append(t)
+        console.print(Panel(
+            Group(*lines),
+            title=f"[bold red]✗ {len(bad)} link{'s' if len(bad) != 1 else ''} couldn't be loaded[/]",
+            title_align="left", border_style="red", padding=(0, 1),
+        ))
+    good, overlaps = _find_overlaps(good)
+    if overlaps:
+        lines = [Text(f"• {src.title[:50]} — {why}", style="dim") for src, why in overlaps[:8]]
+        console.print(Panel(
+            Group(*lines),
+            title=f"[yellow]⚠ {len(overlaps)} duplicate video{'s' if len(overlaps) != 1 else ''} skipped[/]",
+            title_align="left", border_style="yellow", padding=(0, 1),
+        ))
     if not good:
-        pause("✗ None of the links could be loaded.")
+        pause("✗ Nothing left to download.")
         return None
     if bad and not Confirm.ask(
         f"[yellow]{len(bad)} link(s) failed to load. Continue with the other {len(good)}?[/]",
@@ -2408,9 +2722,11 @@ def batch_flow(urls: list[str], cookiefile: str | None) -> DownloadResult | None
 
 def ask_urls(mode: str) -> list[str]:
     """Prompt for one URL (single/playlist) or many (batch).  Anything that
-    contains several links is returned as a list."""
+    contains several links is returned as a list.  Text that isn't a link
+    and links pasted twice are reported, never dropped silently."""
     console.print()
     urls: list[str] = []
+    ignored: list[str] = []
     if mode == "batch":
         console.print(
             "[bold]Paste links[/] [dim]— one per line or separated by spaces.\n"
@@ -2423,13 +2739,58 @@ def ask_urls(mode: str) -> list[str]:
                 break
             if not line:
                 break
-            urls += parse_urls(line)
+            found, ign = parse_urls(line)
+            urls += found
+            ignored += ign
     else:
         text = Prompt.ask(
             "[bold]Paste YouTube URL[/]  [dim](or several, separated by spaces)[/]"
         ).strip()
-        urls = parse_urls(text)
-    return _dedupe(urls)
+        urls, ignored = parse_urls(text)
+
+    unique, dups = _dedupe(urls)
+    if ignored:
+        shown = ", ".join(esc(t[:30]) for t in ignored[:5])
+        more = f" (+{len(ignored) - 5} more)" if len(ignored) > 5 else ""
+        console.print(f"[yellow]⚠ Ignored — not a link: {shown}{more}[/]")
+    if dups:
+        lines = [Text(f"• {_short_url(u)}", style="dim") for u in dups[:8]]
+        if len(dups) > 8:
+            lines.append(Text(f"… and {len(dups) - 8} more", style="dim"))
+        console.print(Panel(
+            Group(*lines),
+            title=f"[yellow]⚠ {len(dups)} duplicate link{'s' if len(dups) != 1 else ''} "
+                  f"skipped — each video is downloaded once[/]",
+            title_align="left", border_style="yellow", padding=(0, 1),
+        ))
+    return unique
+
+
+def _find_overlaps(sources: list[Source]) -> tuple[list[Source], list[tuple[Source, str]]]:
+    """After metadata is resolved: drop a video that is also inside a pasted
+    playlist, or that turned out to be the same video as an earlier link."""
+    in_playlist: dict[str, str] = {}
+    for src in sources:
+        if src.is_playlist and src.info:
+            for e in (src.info.get("entries") or []):
+                if e and e.get("id"):
+                    in_playlist.setdefault(str(e["id"]), src.title)
+    kept: list[Source] = []
+    dropped: list[tuple[Source, str]] = []
+    seen: dict[tuple[str, str], int] = {}
+    for n, src in enumerate(sources, 1):
+        vid = str((src.info or {}).get("id") or "")
+        if not src.is_playlist and vid:
+            if vid in in_playlist:
+                dropped.append((src, f"already part of playlist “{in_playlist[vid][:40]}”"))
+                continue
+            key = (str((src.info or {}).get("extractor_key") or ""), vid)
+            if key in seen:
+                dropped.append((src, f"same video as link #{seen[key]}"))
+                continue
+            seen[key] = n
+        kept.append(src)
+    return kept, dropped
 
 
 def start_download(mode: str) -> DownloadResult | None:
@@ -2513,36 +2874,41 @@ def finished(result: DownloadResult) -> bool:
             border_style="green", padding=(0, 2),
         ))
         console.print(f"\n[bold]Saved in:[/] {esc(str(DOWNLOAD_DIR))}")
-    elif result.partial:
-        console.print(Panel(
-            Align.center(
-                f"[bold yellow]⚠ Partially Complete — "
-                f"{result.succeeded}/{result.total} downloaded[/]"
-            ),
-            border_style="yellow", padding=(0, 2),
-        ))
-        console.print(f"\n[bold]Saved in:[/] {esc(str(DOWNLOAD_DIR))}")
-        if result.errors:
-            console.print("\n[bold yellow]Items that failed:[/]")
-            for msg in result.errors:
-                console.print(f"    • {esc(msg)}")
     else:
-        console.print(Panel(
-            Align.center("[bold red]✗  Download Failed[/]"),
-            border_style="red", padding=(0, 2),
-        ))
-        if result.errors:
+        if result.partial:
+            console.print(Panel(
+                Align.center(
+                    f"[bold yellow]⚠ Partially Complete — "
+                    f"{result.succeeded}/{result.total} downloaded, "
+                    f"{result.failed} failed[/]"
+                ),
+                border_style="yellow", padding=(0, 2),
+            ))
+            console.print(f"\n[bold]Saved in:[/] {esc(str(DOWNLOAD_DIR))}")
+        else:
+            console.print(Panel(
+                Align.center("[bold red]✗  Download Failed[/]"),
+                border_style="red", padding=(0, 2),
+            ))
+        if not result.failures and result.errors:
             console.print("\n[bold yellow]Reported reason(s):[/]")
             for msg in result.errors:
                 console.print(f"    • {esc(msg)}")
-        console.print("\n[bold yellow]Troubleshooting tips:[/]")
-        console.print("    • Check your internet connection")
-        console.print("    • Verify the URL is correct and the video is public")
-        console.print("    • YouTube may have changed — update: "
-                      "[green]pip install -U yt-dlp[/]")
-        console.print("    • Try a lower quality or different format")
-        console.print("    • Try enabling cookies support (place cookies.txt "
-                      "next to this script)")
+        hints = {f["hint"] for f in result.failures if f["hint"]}
+        if result.failed_file:
+            console.print(
+                f"\n[bold]📝 Failed links saved to[/] {esc(result.failed_file)}\n"
+                "[dim]   Open “Multiple URLs” and paste them to try again later.[/]"
+            )
+        if not hints:
+            console.print("\n[bold yellow]Troubleshooting tips:[/]")
+            console.print("    • Check your internet connection")
+            console.print("    • Verify the URL is correct and the video is public")
+            console.print("    • YouTube may have changed — update: "
+                          "[green]pip install -U yt-dlp[/]")
+            console.print("    • Try a lower quality or different format")
+            console.print("    • Try enabling cookies support (place cookies.txt "
+                          "next to this script)")
     console.print()
     return Confirm.ask("[bold]Download another?[/]", default=True)
 
@@ -2622,7 +2988,22 @@ def main() -> None:
         startup_checks()
 
         while True:
-            result = main_menu()
+            try:
+                result = main_menu()
+            except (KeyboardInterrupt, EOFError):
+                raise
+            except Exception as e:
+                log.exception("Error inside a menu flow")
+                head, hint = explain_error(str(e))
+                console.print(Panel(
+                    f"[bold red]✗ Something went wrong[/]\n[red]{esc(head)}[/]"
+                    + (f"\n[dim]→ {esc(hint)}[/]" if hint else "")
+                    + f"\n[dim]Details saved to {DEBUG_LOG_FILE.name}. "
+                      "You're back at the menu — nothing was lost.[/]",
+                    border_style="red", padding=(0, 1),
+                ))
+                pause()
+                continue
             if result is None:
                 continue
             if result == "exit":
