@@ -1,0 +1,13 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# Path to the speedtest app
+APP_DIR="/data/data/com.termux/files/home/personal-scripts/yt_dlp"
+SCRIPT_NAME="app.py"
+
+# Navigate to the directory and run the script
+cd "$APP_DIR" || exit
+python "$SCRIPT_NAME"
+
+# Keep the window open for a few seconds so results can be read
+# echo ""
+# read -n 1 -s -r -p "Press any key to close..."

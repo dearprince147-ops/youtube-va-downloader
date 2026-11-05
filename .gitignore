@@ -1,0 +1,39 @@
+# ── Secrets ────────────────────────────────────────────────────
+# YouTube session cookies — never commit these.
+cookies.txt
+*Cookies.txt
+
+# ── Backups ────────────────────────────────────────────────────
+*.bak
+*.bak.*
+*~
+
+# ── Generated at runtime ───────────────────────────────────────
+settings.json
+history.md
+debug.log
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ── Downloads / media (in case the app is pointed at the repo) ─
+YouTube/
+*.part
+*.ytdl
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.wav
+
+# ── OS / editor cruft ──────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
