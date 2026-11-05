@@ -1,10 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Path to the speedtest app
-APP_DIR="/data/data/com.termux/files/home/personal-scripts/yt_dlp"
+# Run app.py from whatever directory this launcher lives in,
+# so it works both locally and from a fresh clone.
+APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SCRIPT_NAME="app.py"
 
-# Navigate to the directory and run the script
 cd "$APP_DIR" || exit
 python "$SCRIPT_NAME"
 

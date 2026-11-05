@@ -179,17 +179,14 @@ Run the downloader with a single tap from your Android home screen using
 [Termux:Widget](https://github.com/termux/termux-widget).
 
 1. **Install Termux:Widget** (from F-Droid) and the base **Termux** app.
-2. **Create the shortcut directory and script:**
+2. **Create the shortcut directory and symlink the included launcher:**
    ```bash
    mkdir -p ~/.shortcuts
-   cat > ~/.shortcuts/yt_dlp <<'EOF'
-   #!/data/data/com.termux/files/usr/bin/bash
-   cd ~/youtube-va-downloader || exit
-   python app.py
-   EOF
-   chmod +x ~/.shortcuts/yt_dlp
+   ln -sf ~/youtube-va-downloader/yt_dlp ~/.shortcuts/yt_dlp
+   chmod +x ~/youtube-va-downloader/yt_dlp
    ```
-   *(Adjust the `cd` path to wherever you cloned the repo.)*
+   *(Adjust the path to wherever you cloned the repo.)* The launcher `cd`s into its own
+   directory and runs `app.py`, so it works from any clone location without editing.
 
 3. **Add the widget to your home screen:**
    - Long-press an empty spot on your home screen → **Widgets** → **Termux:Widget**.
@@ -201,21 +198,6 @@ Run the downloader with a single tap from your Android home screen using
 
 > Tip: to make the shortcut appear with a nicer name, use a filename like `YouTube Downloader`
 > (spaces are allowed) or create a matching icon in `~/.shortcuts/icons/`.
-
----
-
-## Files
-
-| File | Purpose | Committed? |
-|------|---------|:----------:|
-| `app.py` | The whole application. | ✅ |
-| `yt_dlp` | Termux widget launcher script (example). | ✅ |
-| `README.md` | This file. | ✅ |
-| `settings.json` | Your saved preferences. | ❌ (generated) |
-| `history.md` | Download log, grows over time. | ❌ (generated) |
-| `cookies.txt` | YouTube session cookies. **Secret.** | ❌ |
-| `debug.log` | Error log written on crashes. | ❌ |
-| `*.bak` | Backup copies. | ❌ |
 
 ---
 
