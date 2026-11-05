@@ -24,7 +24,7 @@ Works on **Android (Termux), Linux, macOS, and Windows 10/11**.
 - **H.264 / AAC safety net** — re-encodes when needed so files play everywhere.
 - **Skip already-downloaded** items in playlists.
 - **Cookie authentication** — download age/members-only content using your `cookies.txt` (ask / on / off modes).
-- **Automatic dependency management** — installs `yt-dlp` / `rich` if missing, and ffmpeg on Windows.
+- **Automatic dependency management** — installs `yt-dlp` / `rich` if missing, ffmpeg on Windows, and **Python itself** on Windows via the `yt.bat` launcher.
 - **Download history** — everything logged to `history.md`.
 - **Cross-platform** — Termux storage setup and Windows ffmpeg auto-install included.
 
@@ -118,33 +118,38 @@ Downloads go to `%USERPROFILE%\Downloads\YouTube\`.
 
 #### Windows launcher (`yt.bat`)
 
-Double-clicking `yt.bat` runs the app **inside Windows Terminal using PowerShell**
-(falling back to plain PowerShell if Windows Terminal isn't installed).
+**Just double-click `yt.bat`.** It handles everything:
 
-**On first run it offers to install a `yt` command**, so afterwards you can:
+1. **Finds Python.** If Python is missing, it installs it automatically —
+   first via `winget` (`Python.Python.3.12`), and if winget isn't available, by
+   downloading and running the official python.org installer with
+   *"Add python.exe to PATH"* enabled. It then relaunches itself so the new
+   PATH takes effect.
+2. **Adds a `yt` command to your PATH.** A small `yt.cmd` shim is written to
+   `%LOCALAPPDATA%\Microsoft\WindowsApps` (already on every user's PATH), so
+   **no admin rights are needed**. On the first run it prints a tip; after that
+   it is silent.
+3. **Launches the app** in **Windows Terminal** using **PowerShell**
+   (`wt.exe -d "<app folder>" powershell.exe`), falling back to a plain
+   PowerShell window if Windows Terminal isn't installed.
 
-- press **Win+R**, type **`yt`**, press **Enter**, or
+After the first run you can start the app any of these ways:
+
+- press **Win+R**, type **`yt`**, press **Enter**,
 - type **`yt`** in any Terminal / PowerShell / cmd window,
+- or double-click **`yt.bat`** again.
 
-...and the app launches the same way — no `python app.py` needed.
+> `-NoExit` keeps the terminal open if the app ever crashes, so you can read the
+> error instead of the window vanishing. The app then installs `yt-dlp`, `rich`,
+> and ffmpeg on its own as needed.
 
-The shortcut is a small `yt.cmd` shim placed in your per-user
-`%LOCALAPPDATA%\Microsoft\WindowsApps` folder (already on every PATH), so
-**no admin rights are required**. If that folder is locked down, the script
-offers a machine-wide PATH fallback, which asks for **elevation** (a UAC prompt)
-once — and only then.
-
-> Requirements: Python on PATH (tick *"Add Python to PATH"* when installing) and,
-> ideally, Windows Terminal (usually pre-installed on Windows 11; install it from
-the Microsoft Store on Windows 10 for the tabbed experience).
-
-#### Run without a launcher (manual)
+#### Run without the launcher (manual)
 
 ```powershell
 python app.py
 ```
 
-Or double-click `app.py` directly — the console window stays open at the end so
+Or double-click `app.py` directly — its console window stays open at the end so
 you can read the results.
 
 ---
